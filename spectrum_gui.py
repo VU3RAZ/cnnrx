@@ -112,6 +112,17 @@ DEMOD_MODES = {
     "CW":  (    500,    500,     0, "CW / Morse"),
 }
 
+# Standard intermediate rate fed to the demodulator, regardless of hardware
+# sample rate.  Chosen to be ≥ 2× the channel bandwidth with headroom.
+DEMOD_IF_RATES = {
+    "WFM": 256_000,   # > 200 kHz channel; preserves stereo pilot at 38 kHz
+    "NFM":  48_000,   # > 12.5 kHz channel
+    "AM":   48_000,   # > 10 kHz channel; resample to AUDIO_RATE is then 1:1
+    "USB":  24_000,   # > 3 kHz audio BW
+    "LSB":  24_000,
+    "CW":   12_000,   # > 500 Hz BW
+}
+
 DARK   = "#111122"
 PLOTBG = "#0a0a1a"
 ACCENT = "#00dd88"
@@ -273,6 +284,21 @@ def _resample(audio, from_rate, to_rate):
     from_rate, to_rate = int(from_rate), int(to_rate)
     g = gcd(from_rate, to_rate)
     return resample_poly(audio, to_rate // g, from_rate // g).astype(np.float32)
+
+
+def _resample_iq(iq, from_rate, to_rate):
+    """Resample complex IQ to a new rate.  I and Q are resampled separately
+    so that resample_poly's real-valued polyphase filter is used correctly.
+    The built-in Kaiser anti-aliasing filter prevents aliasing on decimation."""
+    from scipy.signal import resample_poly
+    from_rate, to_rate = int(from_rate), int(to_rate)
+    if from_rate == to_rate:
+        return iq
+    g = gcd(from_rate, to_rate)
+    up, down = to_rate // g, from_rate // g
+    ri = resample_poly(np.real(iq).astype(np.float64), up, down)
+    rq = resample_poly(np.imag(iq).astype(np.float64), up, down)
+    return (ri + 1j * rq).astype(np.complex64)
 
 
 def _downconvert(iq, offset_hz, srate, state=None):
@@ -1477,13 +1503,21 @@ class SpectrumWindow(QMainWindow):
                     iq_segs_len = len(iq_segs[0])
                     iq_block  = iq_block[:accum_size]
 
+                    # ── Pre-decimate to standard IF rate ──────────────────
+                    # Demodulator always sees a fixed rate regardless of
+                    # which hardware is in use or its raw sample rate.
+                    if_rate = DEMOD_IF_RATES[self._demod_mode]
+                    hw_rate = int(radio.srate)
+                    if hw_rate != if_rate:
+                        iq_block = _resample_iq(iq_block, hw_rate, if_rate)
+
                     if last_sig_db < self._demod_squelch:
-                        n_sil = int(accum_size * AUDIO_RATE / radio.srate)
+                        n_sil = int(len(iq_block) * AUDIO_RATE / if_rate)
                         audio_buf = np.concatenate(
                             [audio_buf, np.zeros(n_sil, dtype=np.float32)])
                     else:
                         try:
-                            audio = run_demod(iq_block, radio.srate,
+                            audio = run_demod(iq_block, if_rate,
                                               self._demod_mode, state=state)
                             audio = np.clip(audio * self._demod_vol, -1.0, 1.0)
                             audio_buf = np.concatenate([audio_buf, audio])
