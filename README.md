@@ -13,7 +13,7 @@ A real-time spectrum analyzer and demodulator for multiple SDR devices, built wi
 | ADALM Pluto (PlutoSDR) | `plutosdr` | 2.5 · 4 · 8 · 16 · 20 MSps | 0–73 dB | 325 MHz – 3.8 GHz |
 | LimeSDR Mini | `lime` | 2 · 4 · 8 · 16 · 30.72 MSps | 0–70 dB | 10 MHz – 3.5 GHz |
 
-Connected devices are auto-detected at startup and shown with **●** in the hardware selector. Undetected devices are shown with **○** and can still be selected (will error on Start if not present).
+Connected devices are auto-detected at startup and shown with **●** in the hardware selector. Undetected devices are shown with **○**.
 
 ---
 
@@ -21,11 +21,12 @@ Connected devices are auto-detected at startup and shown with **●** in the har
 
 - Real-time spectrum display with peak hold
 - Scrolling waterfall display
-- I/Q amplitude and phase correction (manual + auto-calibrate)
+- Resizable spectrum / waterfall / sidebar panels (drag the dividers)
+- I/Q amplitude and phase correction with auto-calibrate
 - Analog demodulator: **WFM · NFM · AM · USB · LSB · CW**
-- Mouse crosshair with frequency readout
+- Pre-decimation to a fixed intermediate rate per mode — demodulator sees the same sample rate regardless of which hardware is in use
+- Mouse crosshair with live frequency readout
 - Click-to-tune demodulator center frequency
-- Resizable spectrum / waterfall / sidebar panels
 - CLI version for headless use
 
 ---
@@ -47,19 +48,12 @@ Connected devices are auto-detected at startup and shown with **●** in the har
 sudo apt install python3-pyqt5 python3-soapysdr libportaudio2
 ```
 
-For RTL-SDR:
-```bash
-sudo apt install soapysdr-module-rtlsdr
-```
+Additional SoapySDR modules for each device:
 
-For ADALM Pluto:
 ```bash
-sudo apt install soapysdr-module-plutosdr
-```
-
-For LimeSDR Mini:
-```bash
-sudo apt install soapysdr-module-lms7
+sudo apt install soapysdr-module-rtlsdr      # RTL-SDR
+sudo apt install soapysdr-module-plutosdr    # ADALM Pluto
+sudo apt install soapysdr-module-lms7        # LimeSDR Mini
 ```
 
 ### Python packages
@@ -93,7 +87,7 @@ python3 spectrum_gui.py
 4. Move the mouse over either plot to read frequency on the crosshair
 5. Left-click to lock the demodulator to that frequency
 6. Select mode (WFM/NFM/AM/USB/LSB/CW), adjust volume and squelch, press **▶ Demod**
-7. Use **Auto Calibrate** to measure and correct I/Q amplitude/phase imbalance (SDRplay RSP1)
+7. Use **Auto Calibrate** to measure and correct I/Q imbalance (primarily for SDRplay RSP1)
 
 ### CLI
 
@@ -125,25 +119,28 @@ sudo python3 reset_usb.py 001 004  # adjust to match your device
 
 ## Demodulation Modes
 
-| Mode | Channel BW | Audio BW | Notes |
-|------|-----------|----------|-------|
-| WFM | 200 kHz | 15 kHz | Broadcast FM, 75 µs de-emphasis |
-| NFM | 12.5 kHz | 3 kHz | Amateur / PMR narrowband FM |
-| AM | 10 kHz | 5 kHz | Envelope detection |
-| USB | 3 kHz | 3 kHz | Upper sideband SSB |
-| LSB | 3 kHz | 3 kHz | Lower sideband SSB |
-| CW | 500 Hz | 500 Hz | Morse, 700 Hz BFO |
+The demodulator receives IQ pre-decimated to a fixed intermediate rate per mode, independent of hardware sample rate:
+
+| Mode | IF rate | Channel BW | Audio BW | Notes |
+|------|---------|-----------|----------|-------|
+| WFM | 256 kHz | 200 kHz | 15 kHz | Broadcast FM, 75 µs de-emphasis, stereo pilot preserved |
+| NFM | 48 kHz | 12.5 kHz | 3 kHz | Amateur / PMR narrowband FM |
+| AM | 48 kHz | 10 kHz | 5 kHz | Envelope detection |
+| USB | 24 kHz | 3 kHz | 3 kHz | Upper sideband SSB |
+| LSB | 24 kHz | 3 kHz | 3 kHz | Lower sideband SSB |
+| CW | 12 kHz | 500 Hz | 500 Hz | Morse, 700 Hz BFO |
 
 ---
 
 ## Architecture Notes
 
-- **`Radio()` is opened inside `_WorkerThread(QThread)`** — the miri/libusb driver registers Qt `QSocketNotifier` objects; opening from the main thread triggers a warning and can cause instability
-- **`HARDWARE_PROFILES`** dict stores per-device sample rates, gain range, frequency limits, and `max_chunk` (max samples per `readStream` call — the miri driver has a hard limit of 4096; all others use 131072)
-- **`_DemodState`** carries phase and filter `zi` state across IQ blocks — prevents the mixing-tone phase reset, FM discriminator gap, and IIR/FIR startup transients that otherwise cause choppy audio
-- **IQ accumulation** (~25 ms) before calling `run_demod` reduces `resample_poly` call rate ~40× and keeps audio smooth at all sample rates
-- **`draw_idle()`** (not `draw()`) is used for all canvas updates so the Qt event loop never blocks the worker thread during renders
-- Spectrum and waterfall are in separate `matplotlib.Figure` objects inside a `QSplitter(Vertical)`; X-axis sync is done via `xlim_changed` callbacks with a re-entrancy guard
+- **`Radio()` opened inside `_WorkerThread(QThread)`** — the miri/libusb driver registers Qt `QSocketNotifier` objects; opening from the main thread triggers warnings and can cause instability
+- **`HARDWARE_PROFILES`** stores per-device sample rates, gain range, frequency limits, and `max_chunk` (max samples per `readStream` call — miri is limited to 4096; all others use 131072)
+- **Pre-decimation to IF rate** — after accumulating ~25 ms of IQ, `_resample_iq()` brings the block from the hardware sample rate to the mode's fixed IF rate before `run_demod`; scipy's Kaiser anti-aliasing filter is applied automatically; the demod functions always see consistent input rates and filter coefficients across all hardware
+- **`_DemodState`** carries mixing-tone phase, FM discriminator last sample, BFO phase, and all FIR/IIR filter `zi` states across IQ blocks — eliminates phase resets and filter transients at block boundaries
+- **IQ accumulation** (~25 ms, power-of-two samples) reduces `resample_poly` call rate ~40× vs processing every small radio frame
+- **`draw_idle()`** used for all canvas updates — Qt event loop never blocks the worker thread during renders
+- Spectrum and waterfall in separate `matplotlib.Figure` objects inside a `QSplitter(Vertical)`; X-axis sync via `xlim_changed` callbacks with re-entrancy guard
 
 ---
 

@@ -84,10 +84,23 @@ python3 spectrum_gui.py
 - `AUDIO_OK` flag: if `sounddevice` or PortAudio is unavailable, Start button is disabled gracefully
 - `_DemodThread(QThread)` — second QThread for audio; `sig_level = pyqtSignal(float)` sends signal strength to main thread
 - Worker feeds every corrected IQ frame into `_demod_q` (`queue.Queue(maxsize=64)`); spectrum and demod pipelines never block each other
-- **IQ accumulation**: demod body collects ~25 ms of IQ (`ACCUM_SECS=0.025`, rounded to a power-of-two based on `radio.srate`) before calling `run_demod` — reduces `resample_poly` call rate ~40× and eliminates choppy audio caused by tiny-block DSP overhead
+- **IQ accumulation**: demod body collects ~25 ms of IQ (`ACCUM_SECS=0.025`, rounded to a power-of-two based on `radio.srate`) before the pre-decimation and demodulation steps
+- **Pre-decimation to standard IF rate**: after accumulation, `_resample_iq()` brings the IQ block from the hardware sample rate down to a fixed per-mode intermediate rate (`DEMOD_IF_RATES`) before passing to `run_demod` — the demodulator always sees the same rate regardless of hardware
 - `_demod_body()` uses `sounddevice.OutputStream` blocking write with `WRITE_CHUNK=2048`
 - Cyan `axvline` demod marker + `axvspan` BW indicator on both axes; `axvspan` can't be moved so it's `.remove()`d and recreated at new position each click (`_update_demod_marker()`)
 - USB span extends right of center; LSB extends left; all others are centered
+
+**Standard IF rates (`DEMOD_IF_RATES`):**
+```python
+DEMOD_IF_RATES = {
+    "WFM": 256_000,   # > 200 kHz channel; preserves stereo pilot at 38 kHz
+    "NFM":  48_000,   # > 12.5 kHz channel
+    "AM":   48_000,   # > 10 kHz channel; resample to AUDIO_RATE is then 1:1
+    "USB":  24_000,   # > 3 kHz audio BW
+    "LSB":  24_000,
+    "CW":   12_000,   # > 500 Hz BW
+}
+```
 
 **Demodulation continuity (`_DemodState`):**
 - Created once per demod session; reset on mode or frequency change (>1 kHz)
@@ -101,7 +114,8 @@ python3 spectrum_gui.py
 - `_lpf(cutoff_hz, srate, ntaps=127)` — `scipy.signal.firwin` lowpass
 - `_apply_lpf(iq, cutoff_hz, srate, state, key)` — FIR lowpass on complex IQ; optional `state`/`key` for zi continuity
 - `_apply_iir(b, a, x, state, key)` — IIR/FIR on real signal; optional `state`/`key` for zi continuity
-- `_resample(audio, from_rate, to_rate)` — `scipy.signal.resample_poly` with GCD reduction
+- `_resample(audio, from_rate, to_rate)` — `scipy.signal.resample_poly` with GCD reduction, for real audio
+- `_resample_iq(iq, from_rate, to_rate)` — resamples complex IQ by applying `resample_poly` to I and Q separately; scipy's Kaiser anti-aliasing filter prevents aliasing on decimation
 - `_downconvert(iq, offset_hz, srate, state)` — shift baseband by `offset_hz`; `state` keeps phasor phase continuous across blocks
 - `demod_fm(iq, srate, channel_bw, audio_bw, deemph_tau, state)` — FM discriminator + optional de-emphasis IIR
 - `demod_am(iq, srate, channel_bw, audio_bw, state)` — envelope detection + single-pole DC block
