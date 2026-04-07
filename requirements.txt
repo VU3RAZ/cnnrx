@@ -1,0 +1,16 @@
+# SDR Spectrum Analyzer — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# System packages required (not pip-installable):
+#   sudo apt install python3-pyqt5          # Qt5 GUI toolkit
+#   sudo apt install python3-soapysdr       # SoapySDR Python bindings + miri driver
+#   sudo apt install libportaudio2          # PortAudio runtime for sounddevice/audio output
+#
+# The miri (Mirics MSi2500) SoapySDR driver is bundled with libsoapysdr in Ubuntu.
+# If the RSP1 is not detected, try: sudo python3 reset_usb.py 001 004
+
+numpy>=1.24
+matplotlib>=3.7
+scipy>=1.10
+PyQt5>=5.15
+sounddevice>=0.4
