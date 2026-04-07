@@ -4,14 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Three utilities for working with the SDRplay RSP1 (MSI001 tuner + MSI2500 USB ADC):
-- `spectrum.py` — real-time CLI spectrum analyzer via SoapySDR
-- `spectrum_gui.py` — full PyQt5 GUI spectrum analyzer with waterfall and I/Q correction
-- `reset_usb.py` — hardware reset via Linux ioctl (useful if the RSP1 becomes unresponsive)
+Three utilities for working with SDR hardware via SoapySDR:
+- `spectrum.py` — real-time CLI spectrum analyzer
+- `spectrum_gui.py` — full PyQt5 GUI spectrum analyzer with waterfall, I/Q correction, and demodulator
+- `reset_usb.py` — hardware USB reset via Linux ioctl (useful if a device becomes unresponsive)
 
-Hardware detected as: `Bus 001 Device 004: ID 1df7:2500 SDRplay RSP1`, SoapySDR driver `miri`.
+**Supported hardware (`multi-hardware` branch):**
 
-Valid sample rates for MSI2500: 2048000, 2496000, 4000000, 6000000, 8000000 Hz.
+| Driver | Device | Sample rates | Gain | Freq range |
+|--------|--------|-------------|------|------------|
+| `miri` | SDRplay RSP1 (MSI001/MSI2500) | 2.048–8 MSps | 0–60 dB | 100 kHz–2 GHz |
+| `rtlsdr` | RTL-SDR (RTL2832U) | 1.024–3.2 MSps | 0–50 dB | 24–1766 MHz |
+| `plutosdr` | ADALM Pluto (PlutoSDR) | 2.5–20 MSps | 0–73 dB | 325 MHz–3.8 GHz |
+| `lime` | LimeSDR Mini | 2–30.72 MSps | 0–70 dB | 10 MHz–3.5 GHz |
+
+Primary test hardware: `Bus 001 Device 004: ID 1df7:2500 SDRplay RSP1`, SoapySDR driver `miri`.
+
+## Branch strategy
+
+- `master` — stable, SDRplay RSP1 only
+- `multi-hardware` — adds RTL-SDR, ADALM Pluto, LimeSDR Mini via `HARDWARE_PROFILES`
 
 ## spectrum_gui.py
 
@@ -28,14 +40,23 @@ python3 spectrum_gui.py
 **Threading model:**
 - Qt main thread owns all GUI and matplotlib canvas updates; uses `draw_idle()` (never `draw()`) so renders are non-blocking and don't starve the worker
 - Worker runs as a `QThread` subclass (`_WorkerThread`) — **must be QThread, not `threading.Thread`**: the miri driver uses libusb which registers Qt `QSocketNotifier` objects; doing this from a plain Python thread causes heap corruption and a crash
-- **`Radio()` is constructed inside `_worker_body()`**, not in the main thread — this is what eliminates the `QSocketNotifier` warning; `_do_start()` only stores pending parameters (`_pending_freq`, `_pending_srate`, `_pending_gain`) and starts the thread
+- **`Radio()` is constructed inside `_worker_body()`**, not in the main thread — this eliminates the `QSocketNotifier` warning; `_do_start()` only stores pending parameters (`_pending_driver`, `_pending_freq`, `_pending_srate`, `_pending_gain`, `_pending_gain_max`, `_pending_max_chunk`) and starts the thread
 - `queue.Queue(maxsize=2)` passes results to the main thread; oldest frame dropped if consumer is slow
 - Worker never touches Qt objects — errors and calibration results are sent via the queue as tagged tuples: `("error", msg)`, `("calibration", alpha, phi, irr)`
 - `QTimer` at 50 ms polls the queue and redraws (`_tick`)
 - On stop: `radio.deactivate()` is called *before* `thread.wait()` so the blocking `readStream` returns immediately rather than waiting out the 2 s timeout
 
+**Hardware profiles (`HARDWARE_PROFILES`):**
+- Dict keyed by SoapySDR driver name: `"miri"`, `"rtlsdr"`, `"plutosdr"`, `"lime"`
+- Each profile contains: `label`, `srates` (list), `srate_labels`, `gain_min`, `gain_max`, `freq_min`, `freq_max`, `max_chunk`
+- `max_chunk` — max samples per `readStream` call; miri has a hard driver limit of 4096; all others use 131072
+- `_enumerate_available_drivers()` — probes each driver at startup; returns list of connected driver keys
+- Hardware combo in sidebar shows `●` for connected devices, `○` for absent; selecting hardware repopulates the sample-rate combo and updates the gain slider range
+- Hardware, sample-rate, and FFT combos are all locked while the radio is running
+- `Radio()` accepts `gain_max` and `max_chunk` so gain clipping and read chunking are hardware-correct
+
 **DSP pipeline (worker thread):**
-1. `radio.read(n)` — guaranteed-n-samples blocking read from SoapySDR stream
+1. `radio.read(n)` — guaranteed-n-samples blocking read from SoapySDR stream; chunks internally at `radio.max_chunk` to respect per-driver limits
 2. `iq_correct(samples, alpha, phi, dc_remove)` — optional DC removal + I/Q amplitude/phase correction
 3. `_psd_db(samples, n)` — Blackman window → FFT → fftshift → dBFS; called `avg` times and averaged
 4. Result enqueued as `(psd_float32, center_hz, srate, gain)`
@@ -43,12 +64,12 @@ python3 spectrum_gui.py
 **Plot layout:**
 - Spectrum and waterfall are in **two separate `matplotlib.Figure` objects**, each with its own `FigureCanvas`, placed in a `QSplitter(Vertical)` — the boundary is user-draggable
 - X-axis sync (replacing `sharex`) done via `xlim_changed` callbacks with a re-entrancy guard (`_xlim_syncing`) — pan/zoom in either panel syncs both; callbacks do **not** call `draw_idle()` to avoid recursion
-- Sidebar is in a `QScrollArea` inside a `QSplitter(Horizontal)` with `setMinimumWidth`/`setMaximumWidth` instead of `setFixedWidth` — both splitters are user-resizable
+- Sidebar is in a `QScrollArea` inside a `QSplitter(Horizontal)` with `setMinimumWidth`/`setMaximumWidth` — both splitters are user-resizable
 - Waterfall: `imshow` on a `(rows × n)` float32 ring buffer, scrolled with `np.roll(..., axis=0)` each frame
 - Auto Y: `ymax = max(psd) + 10 dB`, span preserved; updates spectrum Y limits and waterfall `clim`
 
 **Key classes and functions:**
-- `Radio` — wraps `SoapySDR.Device(f"driver={driver}")`; `enumerate` and `Device()` both use the string kwarg form (dict form unreliable in this SWIG binding); `read(n)` allocates a fresh contiguous buffer per `readStream` call — never passes numpy slice views, which cause SWIG/libusb memory corruption; `deactivate()` and `close()` are separate so the stream can be unblocked before the thread exits
+- `Radio(driver, freq, srate, gain, gain_max, max_chunk)` — wraps `SoapySDR.Device(f"driver={driver}")`; `enumerate` and `Device()` both use the string kwarg form (dict form unreliable in this SWIG binding); `read(n)` allocates a fresh contiguous buffer per `readStream` call using `self.max_chunk` — never passes numpy slice views, which cause SWIG/libusb memory corruption; `deactivate()` and `close()` are separate so the stream can be unblocked before the thread exits
 - `iq_correct(samples, alpha, phi_rad, dc_remove)` — module-level function; corrects Q channel: `Q_c = (Q − I·sin φ) / (α·cos φ)`
 - `estimate_iq_imbalance(samples)` — estimates α and φ from second-order statistics: `α = √(E[Q²]/E[I²])`, `φ = arcsin(E[I·Q] / √(E[I²]·E[Q²]))`; uses 16× FFT-size sample block
 - `_irr_db(alpha, phi)` — Image Rejection Ratio: `10·log10((1+α²+2α·cos φ)/(1+α²−2α·cos φ))`
