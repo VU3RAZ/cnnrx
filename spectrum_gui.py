@@ -40,12 +40,67 @@ try:
 except (ImportError, OSError):
     AUDIO_OK = False
 
-VALID_SRATES   = [2_048_000, 2_496_000, 4_000_000, 6_000_000, 8_000_000]
-SRATE_LABELS   = ["2.048 MSps", "2.496 MSps", "4.000 MSps", "6.000 MSps", "8.000 MSps"]
 WATERFALL_ROWS = 200
 WF_CMAPS       = ["inferno", "plasma", "magma", "viridis", "turbo"]
-MAX_READ_CHUNK = 4096   # miri driver max per readStream call
 AUDIO_RATE     = 48_000
+
+# ── Per-hardware profiles ─────────────────────────────────────────────────────
+# max_chunk: max samples per readStream call (miri has a hard driver limit of
+#            4096; all other drivers handle large chunks fine)
+HARDWARE_PROFILES = {
+    "miri": {
+        "label":     "SDRplay RSP1 (MSI2500/miri)",
+        "srates":    [2_048_000, 2_496_000, 4_000_000, 6_000_000, 8_000_000],
+        "srate_labels": ["2.048 MSps", "2.496 MSps", "4.000 MSps",
+                         "6.000 MSps", "8.000 MSps"],
+        "gain_min":  0,   "gain_max":  60,
+        "freq_min":  100e3,  "freq_max":  2e9,
+        "max_chunk": 4_096,
+    },
+    "rtlsdr": {
+        "label":     "RTL-SDR (RTL2832U)",
+        "srates":    [1_024_000, 1_536_000, 1_920_000, 2_048_000,
+                      2_400_000, 3_200_000],
+        "srate_labels": ["1.024 MSps", "1.536 MSps", "1.920 MSps",
+                         "2.048 MSps", "2.400 MSps", "3.200 MSps"],
+        "gain_min":  0,   "gain_max":  50,
+        "freq_min":  24e6,   "freq_max":  1_766e6,
+        "max_chunk": 131_072,
+    },
+    "plutosdr": {
+        "label":     "ADALM Pluto (PlutoSDR)",
+        "srates":    [2_500_000, 4_000_000, 8_000_000, 16_000_000, 20_000_000],
+        "srate_labels": ["2.500 MSps", "4.000 MSps", "8.000 MSps",
+                         "16.000 MSps", "20.000 MSps"],
+        "gain_min":  0,   "gain_max":  73,
+        "freq_min":  325e6,  "freq_max":  3_800e6,
+        "max_chunk": 131_072,
+    },
+    "lime": {
+        "label":     "LimeSDR Mini",
+        "srates":    [2_000_000, 4_000_000, 8_000_000, 16_000_000, 30_720_000],
+        "srate_labels": ["2.000 MSps", "4.000 MSps", "8.000 MSps",
+                         "16.000 MSps", "30.720 MSps"],
+        "gain_min":  0,   "gain_max":  70,
+        "freq_min":  10e6,   "freq_max":  3_500e6,
+        "max_chunk": 131_072,
+    },
+}
+
+# Driver keys in display order
+DRIVER_KEYS = ["miri", "rtlsdr", "plutosdr", "lime"]
+
+
+def _enumerate_available_drivers():
+    """Return list of driver keys for hardware actually connected right now."""
+    available = []
+    for key in DRIVER_KEYS:
+        try:
+            if len(SoapySDR.Device.enumerate(f"driver={key}")) > 0:
+                available.append(key)
+        except Exception:
+            pass
+    return available
 
 # Demodulator modes: name → (channel_bw_hz, audio_bw_hz, deemph_tau_s, label)
 DEMOD_MODES = {
@@ -335,7 +390,8 @@ def run_demod(iq, srate, mode, state=None):
 # Radio — SoapySDR wrapper
 # ──────────────────────────────────────────────────────────────────────────────
 class Radio:
-    def __init__(self, driver, freq, srate, gain):
+    def __init__(self, driver, freq, srate, gain,
+                 gain_max=60, max_chunk=131_072):
         results = SoapySDR.Device.enumerate(f"driver={driver}")
         if len(results) == 0:
             raise RuntimeError(f"No SoapySDR device found (driver={driver!r})")
@@ -343,7 +399,9 @@ class Radio:
             self.label = results[0]["label"]
         except Exception:
             self.label = driver
-        self.sdr = SoapySDR.Device(f"driver={driver}")
+        self.sdr       = SoapySDR.Device(f"driver={driver}")
+        self.max_chunk = max_chunk
+        self._gain_max = gain_max
 
         self.sdr.setSampleRate(SOAPY_SDR_RX, 0, srate)
         self.srate = self.sdr.getSampleRate(SOAPY_SDR_RX, 0)
@@ -362,7 +420,8 @@ class Radio:
 
     def _apply_gain(self, g):
         try:
-            self.sdr.setGain(SOAPY_SDR_RX, 0, float(np.clip(g, 0, 60)))
+            self.sdr.setGain(SOAPY_SDR_RX, 0,
+                             float(np.clip(g, 0, self._gain_max)))
             self.gain = self.sdr.getGain(SOAPY_SDR_RX, 0)
         except Exception:
             self.gain = float(g)
@@ -375,11 +434,11 @@ class Radio:
         self._apply_gain(db)
 
     def read(self, n):
-        chunk_buf = np.empty(MAX_READ_CHUNK, dtype=np.complex64)
+        chunk_buf = np.empty(self.max_chunk, dtype=np.complex64)
         result    = np.empty(n, dtype=np.complex64)
         got = 0
         while got < n:
-            want = min(n - got, MAX_READ_CHUNK)
+            want = min(n - got, self.max_chunk)
             sr   = self.sdr.readStream(self.stream, [chunk_buf], want,
                                        timeoutUs=2_000_000)
             if sr.ret < 0:
@@ -494,6 +553,8 @@ class SpectrumWindow(QMainWindow):
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
         self._statusbar.showMessage("Ready — configure and press Start.")
+        # Populate srate combo + gain range for the default hardware
+        self._on_hardware_changed(self._hw_combo.currentIndex())
 
     # ──────────────────────────────────────────────────── Sidebar ────────
 
@@ -507,6 +568,26 @@ class SpectrumWindow(QMainWindow):
         vlay = QVBoxLayout(container)
         vlay.setContentsMargins(8, 8, 8, 8)
         vlay.setSpacing(8)
+
+        # ── Hardware selector ─────────────────────────────────────────────
+        grp = QGroupBox("Hardware")
+        g = QVBoxLayout(grp)
+        self._hw_combo = QComboBox()
+        self._hw_keys  = []
+        available = _enumerate_available_drivers()
+        for key in DRIVER_KEYS:
+            profile = HARDWARE_PROFILES[key]
+            mark = "● " if key in available else "○ "
+            self._hw_combo.addItem(mark + profile["label"])
+            self._hw_keys.append(key)
+        # Default: first available device, or miri if none detected
+        default_idx = 0
+        if available:
+            default_idx = self._hw_keys.index(available[0])
+        self._hw_combo.setCurrentIndex(default_idx)
+        self._hw_combo.currentIndexChanged.connect(self._on_hardware_changed)
+        g.addWidget(self._hw_combo)
+        vlay.addWidget(grp)
 
         # ── Frequency ────────────────────────────────────────────────────
         grp = QGroupBox("Center Frequency")
@@ -533,7 +614,6 @@ class SpectrumWindow(QMainWindow):
         grp = QGroupBox("Sample Rate")
         g = QVBoxLayout(grp)
         self._srate_combo = QComboBox()
-        self._srate_combo.addItems(SRATE_LABELS)
         self._srate_combo.setToolTip("Restart required to change")
         g.addWidget(self._srate_combo)
         vlay.addWidget(grp)
@@ -543,7 +623,7 @@ class SpectrumWindow(QMainWindow):
         g = QVBoxLayout(grp)
         row = QHBoxLayout()
         self._gain_slider = QSlider(Qt.Horizontal)
-        self._gain_slider.setRange(0, 60)
+        self._gain_slider.setRange(0, 60)   # updated by _on_hardware_changed
         self._gain_slider.setValue(30)
         self._gain_label = QLabel("30 dB")
         self._gain_label.setFixedWidth(42)
@@ -1004,6 +1084,21 @@ class SpectrumWindow(QMainWindow):
 
     # ─────────────────────────────────────────────────────── Handlers ────
 
+    def _on_hardware_changed(self, idx):
+        """Repopulate sample-rate combo and adjust gain slider for new hardware."""
+        if idx < 0 or idx >= len(self._hw_keys):
+            return
+        profile = HARDWARE_PROFILES[self._hw_keys[idx]]
+        self._srate_combo.blockSignals(True)
+        self._srate_combo.clear()
+        self._srate_combo.addItems(profile["srate_labels"])
+        self._srate_combo.setCurrentIndex(0)
+        self._srate_combo.blockSignals(False)
+        gmax = profile["gain_max"]
+        cur  = self._gain_slider.value()
+        self._gain_slider.setRange(0, gmax)
+        self._gain_slider.setValue(min(cur, gmax))
+
     def _on_freq_apply(self):
         try:
             mhz = float(self._freq_edit.text())
@@ -1164,16 +1259,22 @@ class SpectrumWindow(QMainWindow):
             self._statusbar.showMessage("Invalid frequency.")
             return
 
-        srate = VALID_SRATES[self._srate_combo.currentIndex()]
-        gain  = self._gain_slider.value()
+        hw_idx  = self._hw_combo.currentIndex()
+        driver  = self._hw_keys[hw_idx]
+        profile = HARDWARE_PROFILES[driver]
+        srate   = profile["srates"][self._srate_combo.currentIndex()]
+        gain    = self._gain_slider.value()
         self._n   = int(self._fft_combo.currentText())
         self._avg = self._avg_spin.value()
 
         # Radio is opened inside the worker QThread so that libusb can register
         # Qt QSocketNotifier objects from a proper QThread context.
-        self._pending_freq  = freq_hz
-        self._pending_srate = srate
-        self._pending_gain  = gain
+        self._pending_driver    = driver
+        self._pending_freq      = freq_hz
+        self._pending_srate     = srate
+        self._pending_gain      = gain
+        self._pending_gain_max  = profile["gain_max"]
+        self._pending_max_chunk = profile["max_chunk"]
 
         ymin = self._ymin_spin.value()
         self._peak   = np.full(self._n, ymin, dtype=np.float32)
@@ -1185,6 +1286,7 @@ class SpectrumWindow(QMainWindow):
         self._peak_line.set_ydata(self._peak)
         self._refresh_irr()
 
+        self._hw_combo.setEnabled(False)
         self._srate_combo.setEnabled(False)
         self._fft_combo.setEnabled(False)
         self._start_btn.setText("■  Stop")
@@ -1219,6 +1321,7 @@ class SpectrumWindow(QMainWindow):
                 self._q.get_nowait()
             except queue.Empty:
                 break
+        self._hw_combo.setEnabled(True)
         self._srate_combo.setEnabled(True)
         self._fft_combo.setEnabled(True)
         self._start_btn.setText("▶  Start")
@@ -1240,10 +1343,12 @@ class SpectrumWindow(QMainWindow):
         # Open device here — inside QThread — so libusb registers
         # Qt QSocketNotifier objects from a proper QThread context.
         try:
-            radio = Radio("miri",
+            radio = Radio(self._pending_driver,
                           self._pending_freq,
                           self._pending_srate,
-                          self._pending_gain)
+                          self._pending_gain,
+                          gain_max=self._pending_gain_max,
+                          max_chunk=self._pending_max_chunk)
         except Exception as exc:
             try:
                 self._q.put_nowait(("error", str(exc)))
